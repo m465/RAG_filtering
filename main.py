@@ -38,7 +38,7 @@ def classify_query(user_query):
     """
 
     response = client.chat.completions.create(
-        model="gpt-4o", # or gpt-3.5-turbo
+        model="gpt-4o-mini", # or gpt-4.1-nano
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_query}
@@ -97,7 +97,7 @@ def retrieval_augmented_generation(user_query, category):
     """
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_query}

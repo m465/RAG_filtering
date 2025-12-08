@@ -1,5 +1,6 @@
 import os
 import string
+from collections import deque
 from openai import OpenAI
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
@@ -26,7 +27,7 @@ client = OpenAI()
 # =======================================================
 class RAGChatBot:
     def __init__(self):
-        self.chat_history = []
+        self.chat_history = deque(maxlen=5)  # Automatically keeps only last 5 conversations
     
     def rephrase_query(self, user_query):
         """
@@ -156,8 +157,9 @@ class RAGChatBot:
 
         final_answer = response.choices[0].message.content
         
-        # Save to history
+        # Save to history (deque automatically keeps only last 5)
         self.chat_history.append((user_query, final_answer))
+        print(self.chat_history)
         
         return final_answer, category
 

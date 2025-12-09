@@ -132,8 +132,11 @@ st.markdown("""
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "memory_type" not in st.session_state:
+    st.session_state.memory_type = "top_k"
+
 if "bot" not in st.session_state:
-    st.session_state.bot = RAGChatBot()
+    st.session_state.bot = RAGChatBot(memory_type=st.session_state.memory_type)
 
 if "documents_processed" not in st.session_state:
     st.session_state.documents_processed = False
@@ -147,6 +150,25 @@ with st.sidebar:
     st.markdown("The system can answer questions from:")
     for category in VALID_CATEGORIES:
         st.markdown(f'<div class="category-badge">{category.replace("_", " ")}</div>', unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    st.header("🧠 Memory Settings")
+    
+    # Memory type selector
+    memory_type = st.selectbox(
+        "Memory Type",
+        options=["top_k", "summary"],
+        index=0 if st.session_state.memory_type == "top_k" else 1,
+        help="**top_k**: Only last 5 messages sent to API\n\n**summary**: Summary + last 5 messages sent to API"
+    )
+    
+    # Update memory type if changed
+    if memory_type != st.session_state.memory_type:
+        st.session_state.memory_type = memory_type
+        # Reinitialize bot with new memory type
+        st.session_state.bot = RAGChatBot(memory_type=memory_type)
+        st.success(f"✅ Memory type updated to: {memory_type}")
     
     st.markdown("---")
     
@@ -167,8 +189,8 @@ with st.sidebar:
                 # Force regenerate - delete old database and create new one
                 process_and_store_vectors(force_regenerate=True)
                 
-                # Reinitialize the bot with fresh database
-                st.session_state.bot = RAGChatBot()
+                # Reinitialize the bot with fresh database and current memory type
+                st.session_state.bot = RAGChatBot(memory_type=st.session_state.memory_type)
                 st.session_state.documents_processed = True
                 st.success("✅ Documents processed successfully!")
             except Exception as e:
@@ -177,7 +199,7 @@ with st.sidebar:
     # Clear chat button
     if st.button("🗑️ Clear Chat History", use_container_width=True):
         st.session_state.messages = []
-        st.session_state.bot = RAGChatBot()
+        st.session_state.bot = RAGChatBot(memory_type=st.session_state.memory_type)
         st.rerun()
     
     st.markdown("---")

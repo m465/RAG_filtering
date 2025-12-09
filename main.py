@@ -26,55 +26,129 @@ client = OpenAI()
 # THE RAG CHATBOT CLASS
 # =======================================================
 class RAGChatBot:
-    def __init__(self):
-        self.chat_history = deque(maxlen=5)  # Automatically keeps only last 5 conversations
+    def __init__(self, memory_type="top_k"):
+        """
+        Initialize RAG ChatBot with memory management.
+        
+        Args:
+            memory_type (str): Either "top_k" (only last 5 messages) or "summary" (summary + last 5 messages)
+        """
+        self.chat_history = []  # Stores tuples: (User, AI) - Only keeps last 5
+        self.summary = ""       # Stores the summary of everything before the last 5
+        self.max_history_len = 5
+        self.memory_type = memory_type  # "top_k" or "summary"
+
+    def manage_history(self):
+        """
+        Checks if history exceeds 5 turns. 
+        If so, pops the oldest turn and merges it into the running summary.
+        """
+        if len(self.chat_history) > self.max_history_len:
+            # 1. Pop the oldest interaction
+            oldest_interaction = self.chat_history.pop(0) 
+            user_text, ai_text = oldest_interaction
+            
+            # 2. Update the Summary using OpenAI
+            print("   [Memory] Compressing old history into summary...")
+            
+            prompt = f"""
+            You are a memory manager. 
+            Current Summary of conversation: "{self.summary}"
+            
+            Newest Old Interaction to merge:
+            User: {user_text}
+            AI: {ai_text}
+            
+            Task: Update the Current Summary to include the key information from the Newest Old Interaction. 
+            Keep the summary concise. Do not lose important details like names, numbers, or specific machinery discussed.
+            """
+            
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "system", "content": "You are a helpful summarizer."},
+                          {"role": "user", "content": prompt}]
+            )
+            
+            # 3. Save new summary
+            self.summary = response.choices[0].message.content.strip()
+            print(f"   [Memory] Summary Updated. (History Len: {len(self.chat_history)})")
+
     
     def rephrase_query(self, user_query):
-        """
-        If history exists, rephrase the new query to include context from previous turns.
-        """
-        if not self.chat_history:
-            return user_query # No history, no need to rephrase
+        # 1. OPTIMIZATION: Check if there is any context at all.
+        # If both history and summary are empty, the user's query MUST be treated as standalone.
+        if not self.chat_history and not self.summary:
+            print("   [Rephraser] First query of session. Skipping rephrase step.")
+            return user_query
 
-        # Format history into a string
-        history_str = "\n".join([f"User: {h[0]}\nAssistant: {h[1]}" for h in self.chat_history])
+        # 2. Format the recent history
+        # We don't need the "No recent conversation" else block anymore 
+        # because the 'if' check above handles the empty case.
+        recent_history_str = "\n".join([f"User: {h[0]}\nAssistant: {h[1]}" for h in self.chat_history])
 
-        system_prompt = """
-        Given the following conversation and a follow-up question, rephrase the follow-up question to be a standalone question.
-        The standalone question should be complete and specific, including necessary context from the conversation history.
+        # 3. Define System Instructions
+        system_instruction = """
+        You are an intelligent query clarifier. 
+        Your job is to rewrite the 'Follow-up input' into a STANDALONE QUESTION.
         
-        Example:
-        History: 
-        User: How much is dinner reimbursement?
-        AI: It is capped at $100.
-        Follow-up: What about for lunch?
-        
-        Standalone Question: What is the reimbursement limit for lunch?
-        
-        Do NOT answer the question. Just rephrase it.
+        Rules:
+        1. Use the 'Context Summary' and 'Recent Chat History' to resolve pronouns (it, that, he, she).
+        2. If the user input is already clear, return it as is.
+        3. Do NOT answer the question. Just rewrite it.
         """
 
+        # 4. Construct User Content
+        user_content = f"""
+        --- CONTEXT SUMMARY (Older Conversations) ---
+        {self.summary if self.summary else "No summary available."}
+
+        --- RECENT CHAT HISTORY (Last 5 Messages) ---
+        {recent_history_str}
+
+        --- FOLLOW-UP INPUT ---
+        {user_query}
+
+        Standalone Question:
+        """
+
+        # 5. Make the Call
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Chat History:\n{history_str}\n\nFollow-up input: {user_query}"}
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_content}
             ],
             temperature=0.3
         )
+
         return response.choices[0].message.content.strip()
 
     def classify_query(self, standalone_query):
         """
         Uses OpenAI to determine which category the query belongs to.
+        Enhanced with category definitions for better routing accuracy.
         """
-        system_prompt = f"""
-        You are an intelligent query router.
-        You must classify the user's query into EXACTLY one of the following categories:
-        {VALID_CATEGORIES}
+        category_definitions = """
+        1. SOPs: Physical machinery (Hydraulic Press), Safety procedures, Emergency stops, Daily operational workflows, Floor management.
+        2. HR_Manual: Employee conduct, Holidays, Leave policy, Benefits, Dress code.
+        3. Technical_Specifications: IT Systems, Software Architecture, Servers, Kubernetes, APIs, Databases (PostgreSQL), Cloud infrastructure.
+        4. Finance_Policy: Reimbursements, Expenses, Concur, Vendor payments, Procurement.
+        5. Legal_Contracts: NDAs, Terms of Service, Liability, Lawsuits.
+        """
         
-        If the query is ambiguous, choose the most likely technical fit.
-        Reply ONLY with the exact category name. Do not add punctuation or explanation.
+        system_prompt = f"""
+        You are a strict query router. 
+        Your goal is to map the user's question to the correct document repository based on the definitions below.
+        
+        {category_definitions}
+        
+        VALID CATEGORIES: {VALID_CATEGORIES}
+        
+        Rules:
+        - If the query is about PHYSICAL MACHINERY (like a 'Press' or 'Button'), it belongs to 'SOPs', NOT Technical_Specifications.
+        - 'Technical_Specifications' is ONLY for Software/IT topics.
+        
+        Return ONLY the category name.
         """
 
         response = client.chat.completions.create(
@@ -108,7 +182,7 @@ class RAGChatBot:
         
          # 1. Rephrase
         standalone_query = self.rephrase_query(user_query)
-        if standalone_query != user_query:
+        if standalone_query.lower() != user_query.lower():
             print(f"   [Rephraser] Updated to: '{standalone_query}'")
         else:
             print(f"   [Rephraser] Kept original.")
@@ -138,14 +212,35 @@ class RAGChatBot:
         context_text = "\n\n".join([doc.page_content for doc in results])
         
         # 2. GENERATION (The 2nd OpenAI Call)
-        system_prompt = f"""
-        You are a helpful assistant for Acme Corp.
-        Answer the user's question using ONLY the provided context from the {category} documents.
-        If the answer is not in the context, say "I don't know."
-        
-        Context:
-        {context_text}
-        """
+        # Build system prompt based on memory_type
+        if self.memory_type == "summary":
+            # Include summary + last 5 messages
+            recent_history_str = "\n".join([f"User: {h[0]}\nAssistant: {h[1]}" for h in self.chat_history])
+            system_prompt = f"""
+            You are a helpful assistant for Acme Corp.
+            
+            Previous Context Summary: {self.summary if self.summary else "No previous summary."}
+            
+            Recent Conversation (Last 5 messages):
+            {recent_history_str if recent_history_str else "No recent conversation."}
+            
+            Answer the question using ONLY the retrieved context below.
+            Context:
+            {context_text}
+            """
+        else:  # memory_type == "top_k"
+            # Only include last 5 messages (no summary)
+            recent_history_str = "\n".join([f"User: {h[0]}\nAssistant: {h[1]}" for h in self.chat_history])
+            system_prompt = f"""
+            You are a helpful assistant for Acme Corp.
+            
+            Recent Conversation (Last 5 messages):
+            {recent_history_str if recent_history_str else "No recent conversation."}
+            
+            Answer the question using ONLY the retrieved context below.
+            Context:
+            {context_text}
+            """
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -159,7 +254,7 @@ class RAGChatBot:
         
         # Save to history (deque automatically keeps only last 5)
         self.chat_history.append((user_query, final_answer))
-        print(self.chat_history)
+        self.manage_history()
         
         return final_answer, category
 

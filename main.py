@@ -4,11 +4,15 @@ from collections import deque
 from openai import OpenAI
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
+from langchain_community.retrievers import BM25Retriever
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
 
 # 1. Setup Configuration
 load_dotenv()
 DB_DIR = "chroma_db_store"
+SOURCE_DIR = "all_docs"
 
 # Define your strict categories (Must match folder names from Phase 2)
 VALID_CATEGORIES = [
@@ -21,6 +25,7 @@ VALID_CATEGORIES = [
 
 # Initialize OpenAI Client
 client = OpenAI()
+embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
 
 # =======================================================
 # THE RAG CHATBOT CLASS
@@ -37,6 +42,47 @@ class RAGChatBot:
         self.summary = ""       # Stores the summary of everything before the last 5
         self.max_history_len = 5
         self.memory_type = memory_type  # "top_k" or "summary"
+
+        self.vector_db = Chroma(persist_directory=DB_DIR, embedding_function=embedding_function)
+        # Initialize BM25 (In-Memory Keyword Search)
+        print("--- INITIALIZING HYBRID RETRIEVER ---")
+        self.bm25_retriever = self._build_bm25_index()
+
+    def _build_bm25_index(self):
+        """
+        Loads all PDFs to build the Keyword Index (BM25).
+        In production, you would save this index to disk, but for this demo, 
+        building it at startup is fine.
+        """
+        print("   [System] Loading documents for Keyword Index (BM25)...")
+        all_docs = []
+        
+        if not os.path.exists(SOURCE_DIR):
+            print("   [Error] Source directory not found. Run generation script first.")
+            return None
+
+        for root, _, files in os.walk(SOURCE_DIR):
+            for file in files:
+                if file.endswith(".pdf"):
+                    file_path = os.path.join(root, file)
+                    category = os.path.basename(root)
+                    
+                    loader = PyPDFLoader(file_path)
+                    docs = loader.load()
+                    
+                    for doc in docs:
+                        doc.metadata["category"] = category
+                        doc.metadata["filename"] = file
+                    
+                    all_docs.extend(docs)
+        
+        # Chunking (Must match the logic used for Vector DB)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
+        chunked_docs = text_splitter.split_documents(all_docs)
+        
+        print(f"   [System] Built BM25 Index with {len(chunked_docs)} chunks.")
+        return BM25Retriever.from_documents(chunked_docs)
+    
 
     def manage_history(self):
         """
@@ -130,10 +176,10 @@ class RAGChatBot:
         """
         category_definitions = """
         1. SOPs: Physical machinery (Hydraulic Press), Safety procedures, Emergency stops, Daily operational workflows, Floor management.
-        2. HR_Manual: Employee conduct, Holidays, Leave policy, Benefits, Dress code.
-        3. Technical_Specifications: IT Systems, Software Architecture, Servers, Kubernetes, APIs, Databases (PostgreSQL), Cloud infrastructure.
+        2. HR_Manual: Employee conduct, Holidays, Leave policy, Benefits, Dress code, Standard Compensation, Bonuses, Legacy clauses, Grandfathered provisions, Retention schemes.
+        3. Technical_Specifications: IT Systems, Software Architecture, Servers, Kubernetes, APIs, Databases (PostgreSQL), Cloud infrastructure, System Logs, Error Codes.
         4. Finance_Policy: Reimbursements, Expenses, Concur, Vendor payments, Procurement.
-        5. Legal_Contracts: NDAs, Terms of Service, Liability, Lawsuits.
+        5. Legal_Contracts: External NDAs, Terms of Service, Liability, Lawsuits, Vendor Contracts. (NOTE: Internal employee policy clauses belong to HR_Manual, not here).
         """
         
         system_prompt = f"""
@@ -145,8 +191,11 @@ class RAGChatBot:
         VALID CATEGORIES: {VALID_CATEGORIES}
         
         Rules:
-        - If the query is about PHYSICAL MACHINERY (like a 'Press' or 'Button'), it belongs to 'SOPs', NOT Technical_Specifications.
-        - 'Technical_Specifications' is ONLY for Software/IT topics.
+        - If the query mentions a 'Clause' related to benefits, bonuses, or internal policy, it is 'HR_Manual'.
+        - 'Legal_Contracts' is primarily for EXTERNAL agreements (NDAs, Terms of Service).
+        - If the query is a specific code (like 'CLAUSE-882' or 'ERR-7719'), infer the category based on the format:
+            - 'ERR-' or 'SYS-' usually implies Technical_Specifications.
+            - 'CLAUSE-' usually implies HR_Manual (if internal) or Legal (if external). Default to HR_Manual if ambiguous.
         
         Return ONLY the category name.
         """
@@ -169,6 +218,67 @@ class RAGChatBot:
             return "SOPs"
 
         return category
+
+    # =======================================================
+    # HYBRID RETRIEVAL LOGIC
+    # =======================================================
+    def hybrid_search(self, query, category, k=5):
+        print(f"   [Hybrid Search] Query: '{query}' | Category: '{category}'")
+        
+        # 1. VECTOR SEARCH (Semantic) - Native Filtering
+        vector_docs = self.vector_db.similarity_search(
+            query, k=k, filter={"category": category}
+        )
+        print(f"     -> Vector found {len(vector_docs)} results.")
+
+        # 2. KEYWORD SEARCH (BM25) - Manual Filtering
+        # BM25 returns top results from *all* docs, so we fetch more (k*2) and filter manually
+        if self.bm25_retriever is None:
+            print("     -> BM25 not available, using vector search only.")
+            bm25_docs_filtered = []
+        else:
+            bm25_docs_raw = self.bm25_retriever.invoke(query)
+            
+            # Filter BM25 results to match the requested category
+            bm25_docs_filtered = [
+                doc for doc in bm25_docs_raw 
+                if doc.metadata.get("category") == category
+            ]
+            print(f"     -> BM25 found {len(bm25_docs_filtered)} valid results (after filtering).")
+
+        # 3. ENSEMBLE (Reciprocal Rank Fusion - RRF)
+        # RRF gives better ranking than simple interleaving by considering both retrievers' scores
+        print(f"     -> Applying Reciprocal Rank Fusion...")
+        
+        # Build document map for quick lookup
+        doc_map = {}
+        for doc in vector_docs + bm25_docs_filtered:
+            doc_map[doc.page_content] = doc
+        
+        # Calculate RRF scores
+        rrf_scores = {}
+        k_constant = 60  # Standard RRF constant
+        
+        # Score vector search results
+        for rank, doc in enumerate(vector_docs):
+            content = doc.page_content
+            rrf_scores[content] = rrf_scores.get(content, 0) + 1 / (k_constant + rank + 1)
+        
+        # Score BM25 results
+        for rank, doc in enumerate(bm25_docs_filtered):
+            content = doc.page_content
+            rrf_scores[content] = rrf_scores.get(content, 0) + 1 / (k_constant + rank + 1)
+        
+        # Sort by RRF score (highest first)
+        sorted_contents = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Reconstruct document list in score order
+        combined_docs = [doc_map[content] for content, score in sorted_contents]
+        
+        print(f"     -> RRF combined {len(combined_docs)} unique documents.")
+        
+        # Return top k
+        return combined_docs[:k]
 
     # =======================================================
     # RAG GENERATION (WITH FILTER)
@@ -194,16 +304,11 @@ class RAGChatBot:
         # Initialize Vector DB Connection (LAZY INITIALIZATION)
         # This prevents file locking issues by only opening the DB when needed
         # IMPORTANT: Must use same embedding model as vector_store.py (HuggingFace)
-        embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
-        vector_db = Chroma(persist_directory=DB_DIR, embedding_function=embedding_function)
+        
         
         # 1. RETRIEVAL (Not an API call, this is local Vector Search)
         # We apply the metadata filter here!
-        results = vector_db.similarity_search(
-            standalone_query,
-            k=3,
-            filter={"category": category} # <--- THIS IS THE MAGIC PART
-        )
+        results = self.hybrid_search(standalone_query, category, k=5)
         
         if not results:
             return "No relevant documents found in this category.", category
